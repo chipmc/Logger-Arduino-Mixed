@@ -86,14 +86,14 @@
 #define ALARMPIN 3         // This one will be used for the RTC Alarm in v9 and v10
 #define INT2PIN 2         // This is the interrupt pin that registers taps
 #define INTNUMBER 0         // so I don't have to use the lookup function
-#define SENSORPIN 5            // This is a pin which connects to the i2c header - future use
+#define PIRPIN 5            // This is a pin which connects to the i2c header - future use
 #define I2CPWR 8            // Turns the i2c port on and off
 #define RESETPIN 16         // This a modification using a bodge wire
 #define TALKPIN 14           // This is the open-drain line for signaling i2c mastery (A0 on the Uno is 14)
 #define THE32KPIN 15      // This is a 32k squarewave from the DS3231 (A1 on the Uno is 15)
 #else                      // These are the pin assignments for the old v8 board
 #define SENSORPIN 2         // Not used now but wired for future use
-#define INT2PIN 3         // This is the interrupt pin that registers taps
+#define PIRPIN 3         // This is the interrupt pin that registers taps
 #define INTNUMBER 1
 #define ALARMPIN 5         // This is the pin with the RTC Alarm clock - not used on Arduino side
 #define I2CPWR 8            // Turns the i2c port on and off
@@ -137,7 +137,7 @@
 #define YELLOWLED 6       // The yellow LED
 #define LEDPWR 7          // This pin turns on and off the LEDs
 // Finally, here are the variables I want to change often and pull them all together here
-#define SOFTWARERELEASENUMBER "2.0.1"
+#define SOFTWARERELEASENUMBER "1.0.0"
 #define PARKCLOSES 19
 #define PARKOPENS 7
 
@@ -176,6 +176,8 @@ void LogHourlyEvent(); // Log Hourly Event()
 void LogDailyEvent(); // Log Daily Event()
 void CheckForBump(); // Check for bump
 void pinChangeISR();      // Thie is the Interrrupt Service Routine for the pin change interrupt
+void SetPinChangeInterrupt(byte Pin);  // Here is where we set the pinchange interrupt
+void ClearPinChangeInterrupt(byte Pin);  // Here is where we clear the pinchange interrupt
 void sleepNow();  // Puts the Arduino to Sleep
 void NonBlockingDelay(int millisDelay);  // Used for a non-blocking delay
 int freeRam();  // Debugging code, to check usage of RAM
@@ -223,6 +225,10 @@ byte accelSensitivity;               // Hex variable for sensitivity
 byte accelThreshold = 100;           // accelThreshold value to decide when the detected sound is a knock or not
 unsigned int debounce;               // This is a minimum debounce value - additional debounce set using pot or remote terminal
 
+// PIR Sensor Variables
+unsigned long warmUpTime = 1000;    // PIR Sensors need 45-60 seconds to warm up
+volatile bool PIRInt = false;       // A flag for the PIR Interrupt
+
 
 // Battery monitor
 float stateOfCharge = 0;            // stores battery charge level value
@@ -257,6 +263,7 @@ void setup()
     pinModeFast(I2CPWR, OUTPUT);            // This is for V10 boards which can turn off power to the external i2c header
     digitalWriteFast(I2CPWR, HIGH);         // Turns on the i2c port
     pinModeFast(RESETPIN,INPUT);            // Just to make sure - if set to output, you cant program the SIMBLEE
+    pinModeFast(PIRPIN, INPUT);            // Set up the interrupt pins, they're set as active low with an external pull-up
     pinModeFast(INT2PIN, INPUT);            // Set up the interrupt pins, they're set as active low with an external pull-up
     pinModeFast(THE32KPIN,INPUT);           // These are the pins tha are used to negotiate for the i2c bus
     pinModeFast(TALKPIN,INPUT);             // These are the pins tha are used to negotiate for the i2c bus
@@ -378,6 +385,8 @@ void setup()
     
     Serial.print(F("Free memory: "));
     Serial.println(freeRam());
+    
+    SetPinChangeInterrupt(PIRPIN);      // Attach the PinChange Interrupt
 }
 
 // Add loop code
@@ -662,6 +671,44 @@ void CheckForBump() // This is where we check to see if an interrupt is set when
         }
         else if ((source & 0x08) != 0x08) Serial.println(F("Interrupt not a tap"));
     }
+    if (PIRInt)
+    {
+        lastBump = millis();    // Reset last bump timer
+        Serial.print("Detected");
+        ledState = !ledState;
+        digitalWrite(REDLED,ledState);
+        PIRInt = false; // Reset the flag
+        TakeTheBus();
+            t = RTC.get();
+        Serial.print(".");
+        GiveUpTheBus();
+        Serial.print(".");
+        if (t == 0) return;     // This means there was an error in reading the real time clock - very rare in testing so will simply throw out this count
+        if (HOURLYPERIOD != currentHourlyPeriod) {
+            LogHourlyEvent();
+        }
+        Serial.print(".");
+        if (DAILYPERIOD != currentDailyPeriod) {
+            LogDailyEvent();
+        }
+        Serial.print(".");
+        hourlyPersonCount++;                    // Increment the PersonCount
+        FRAMwrite16(CURRENTHOURLYCOUNTADDR, hourlyPersonCount);  // Load Hourly Count to memory
+        Serial.print(".");
+        dailyPersonCount++;                    // Increment the PersonCount
+        FRAMwrite16(CURRENTDAILYCOUNTADDR, dailyPersonCount);   // Load Daily Count to memory
+        Serial.print(".");
+        FRAMwrite32(CURRENTCOUNTSTIME, t);   // Write to FRAM - this is so we know when the last counts were saved
+        Serial.print(".");
+        Serial.print(F("Hourly: "));
+        Serial.print(hourlyPersonCount);
+        Serial.print(F(" Daily: "));
+        Serial.print(dailyPersonCount);
+        Serial.print(F(" Reboots: "));
+        Serial.print(bootcount);
+        Serial.print(F("  Time: "));
+        PrintTimeDate(t);
+    }
 }
 
 
@@ -923,6 +970,28 @@ void pinChangeISR()        // Sensor Interrupt Handler
     // just want the thing to wake up
     sleep_disable();         // first thing after waking from sleep is to disable sleep...
     detachInterrupt(INTNUMBER);      // disables interrupt
+}
+
+void SetPinChangeInterrupt(byte Pin)  // Here is where we set the pinchange interrupt
+{
+    *digitalPinToPCMSK(Pin) |= bit (digitalPinToPCMSKbit(Pin));  // enable pin
+    PCIFR  |= bit (digitalPinToPCICRbit(Pin)); // clear any outstanding interrupt
+    PCICR  |= bit (digitalPinToPCICRbit(Pin)); // enable interrupt for the group
+}
+
+void ClearPinChangeInterrupt(byte Pin)  // Here is where we clear the pinchange interrupt
+{
+    *digitalPinToPCMSK(Pin) &= bit (digitalPinToPCMSKbit(Pin));  // disable pin
+    PCIFR  != bit (digitalPinToPCICRbit(Pin)); // clear any outstanding interrupt
+    PCICR  &= bit (digitalPinToPCICRbit(Pin)); // disnable interrupt for the group
+}
+
+ISR (PCINT2_vect)   // interrupt service routine in sleep mode for PIR PinChange Interrupt (D0-D7)
+{
+    // execute code here after wake-up before returning to the loop() function
+    if (inTest == 1 && digitalReadFast(PIRPIN)) {       // remember this is a pin change - want to make sure it is HIGH
+        PIRInt = true;  //
+    }
 }
 
 
