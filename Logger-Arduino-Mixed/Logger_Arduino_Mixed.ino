@@ -228,7 +228,11 @@ unsigned int debounce;               // This is a minimum debounce value - addit
 // PIR Sensor Variables
 unsigned long warmUpTime = 1000;    // PIR Sensors need 45-60 seconds to warm up
 volatile bool PIRInt = false;       // A flag for the PIR Interrupt
+boolean countEnable = false;        // Need to count only once for each time the sensor triggers
 
+// Mixed Sensor Flags
+boolean accelCount = false;         // Propose counting a person based on accelerometer
+boolean pirCount = false;           // Propose counting a person based on PIR sensor
 
 // Battery monitor
 float stateOfCharge = 0;            // stores battery charge level value
@@ -345,7 +349,7 @@ void setup()
     accelSensitivity = FRAMread8(10-SENSITIVITYADDR);
     Serial.println(accelSensitivity);
     Serial.print(F("Debounce set to: "));
-    debounce = FRAMread16(DEBOUNCEADDR)*10;     // We mulitply by ten since debounce is stored in 100ths of a second
+    debounce = FRAMread8(DEBOUNCEADDR)*10;     // We mulitply by ten since debounce is stored in 100ths of a second
     if (debounce > delaySleep) delaySleep = debounce;       // delaySleep must be bigger than debounce afterall
     Serial.println(debounce);
     
@@ -385,8 +389,6 @@ void setup()
     
     Serial.print(F("Free memory: "));
     Serial.println(freeRam());
-    
-    SetPinChangeInterrupt(PIRPIN);      // Attach the PinChange Interrupt
 }
 
 // Add loop code
@@ -427,7 +429,7 @@ void loop()
                 Serial.print(F("Sensitivity set to: "));
                 Serial.println(10-FRAMread8(SENSITIVITYADDR));
                 Serial.print(F("Debounce set to: "));
-                Serial.println(FRAMread16(DEBOUNCEADDR)*10);        // We mulitply by 10 as debounce is stored in 100ths
+                Serial.println(FRAMread8(DEBOUNCEADDR)*10);        // We mulitply by 10 as debounce is stored in 100ths
                 Serial.print(F("Hourly count: "));
                 Serial.println(FRAMread16(CURRENTHOURLYCOUNTADDR));
                 Serial.print(F("Daily count: "));
@@ -468,7 +470,7 @@ void loop()
                 if (debounce > delaySleep) delaySleep = debounce;       // delaySleep must be bigger than debounce afterall
                 Serial.print(F("Debounce set to: "));
                 Serial.println(debounce);
-                FRAMwrite16(DEBOUNCEADDR, debounce/10);     // Remember we store debounce in cSec
+                FRAMwrite8(DEBOUNCEADDR, debounce/10);     // Remember we store debounce in cSec
                 break;
             case '5':  // Reset the current counters
                 Serial.println(F("Counter Reset!"));
@@ -545,7 +547,7 @@ void loop()
     if (inTest == 1) {
         CheckForBump();
         if (millis() >= lastBump + delaySleep) {
-            sleepNow();     // sleep function called here
+        sleepNow();     // sleep function called here
         }
     }
     if (millis() >= lastCheckedControlRegister + controlRegisterDelay) {
@@ -562,7 +564,7 @@ void loop()
         }
         else if (controlRegisterValue & signalDebounceChange)   // If we changed the debounce value on the Simblee side
         {
-            debounce = FRAMread16(DEBOUNCEADDR)*10;     // We multiply by 10 since debounce is stored in cSec
+            debounce = FRAMread8(DEBOUNCEADDR)*10;     // We multiply by 10 since debounce is stored in cSec
             if (debounce > delaySleep) delaySleep = debounce;       // delaySleep must be bigger than debounce afterall
             Serial.print(F("Updated debounce value to:"));
             Serial.println(debounce);
@@ -630,76 +632,51 @@ void CheckForBump() // This is where we check to see if an interrupt is set when
         GiveUpTheBus();
         if ((source & 0x08)==0x08 && millis() >= lastBump + debounce)  // We are only interested in the TAP register and ignore debounced taps
         {
-            Serial.println(F("It is a tap - counting"));
+            accelCount = true;      // Nominate this event for a count
             lastBump = millis();    // Reset last bump timer
             TakeTheBus();
-            t = RTC.get();
+                t = RTC.get();
             GiveUpTheBus();
             if (t == 0) {
                 Serial.println(F("t=0 throwing it out"));
-                return;     // This means there was an error in reading the real time clock - very rare in testing so will simply throw out this count
+                return;     // Error in reading the real time clock - very rare in testing so will simply throw out this count
             }
-            if (HOURLYPERIOD != currentHourlyPeriod) {
-                LogHourlyEvent();
-            }
-            if (DAILYPERIOD != currentDailyPeriod) {
-                LogDailyEvent();
-            }
-            hourlyPersonCount++;                    // Increment the PersonCount
-            FRAMwrite16(CURRENTHOURLYCOUNTADDR, hourlyPersonCount);  // Load Hourly Count to memory
-            dailyPersonCount++;                    // Increment the PersonCount
-            FRAMwrite16(CURRENTDAILYCOUNTADDR, dailyPersonCount);   // Load Daily Count to memory
-            FRAMwrite32(CURRENTCOUNTSTIME, t);   // Write to FRAM - this is so we know when the last counts were saved
-            Serial.print(F("Hourly: "));
-            Serial.print(hourlyPersonCount);
-            Serial.print(F(" Daily: "));
-            Serial.print(dailyPersonCount);
-            Serial.print(F(" Reboots: "));
-            Serial.print(bootcount);
-            Serial.print(F("  Time: "));
-            PrintTimeDate(t);
-            ledState = !ledState;              // toggle the status of the LEDPIN:
-            digitalWrite(REDLED, ledState);    // update the LED pin itself
         }
-        else if (millis() < lastBump + debounce) {
-            Serial.print(F("Tap was debounced - lastBump = "));
-            Serial.print(lastBump);
-            Serial.print(F(" debounce = "));
-            Serial.print(debounce);
-            Serial.print(F(" millis() = "));
-            Serial.println(millis());
-        }
-        else if ((source & 0x08) != 0x08) Serial.println(F("Interrupt not a tap"));
     }
-    if (PIRInt)
+    if(digitalRead(PIRPIN) && countEnable)
     {
         lastBump = millis();    // Reset last bump timer
-        Serial.print("Detected");
+        countEnable = false;    // Make sure we only count once for each trigger
         ledState = !ledState;
         digitalWrite(REDLED,ledState);
         PIRInt = false; // Reset the flag
         TakeTheBus();
             t = RTC.get();
-        Serial.print(".");
         GiveUpTheBus();
-        Serial.print(".");
-        if (t == 0) return;     // This means there was an error in reading the real time clock - very rare in testing so will simply throw out this count
+        if (t == 0) return;     // This means there was an error in reading the real time clock - very rare in testing so throws out this count
+        pirCount = true;
+    }
+    else if (!digitalRead(PIRPIN)) countEnable = true;      // Reset the count enable trigger
+    if (accelCount | pirCount)
+    {
+        // Scenarios we need to think through:
+        if (accelCount && !pirCount) Serial.print(F("Biker - "));           // Biker - likely accelCount and !pirCount - covered
+        if (pirCount && accelCount) Serial.print(F("Hiker - "));        // Walker who steps on accel sensor - both triggered - covered
+        if (pirCount && !accelCount) Serial.print(F("Hiker - "));        // Walker who does not step on accel sensor - PIR sensor only - covered
+
+        pirCount = false;
+        accelCount = false;
         if (HOURLYPERIOD != currentHourlyPeriod) {
             LogHourlyEvent();
         }
-        Serial.print(".");
         if (DAILYPERIOD != currentDailyPeriod) {
             LogDailyEvent();
         }
-        Serial.print(".");
         hourlyPersonCount++;                    // Increment the PersonCount
         FRAMwrite16(CURRENTHOURLYCOUNTADDR, hourlyPersonCount);  // Load Hourly Count to memory
-        Serial.print(".");
         dailyPersonCount++;                    // Increment the PersonCount
         FRAMwrite16(CURRENTDAILYCOUNTADDR, dailyPersonCount);   // Load Daily Count to memory
-        Serial.print(".");
         FRAMwrite32(CURRENTCOUNTSTIME, t);   // Write to FRAM - this is so we know when the last counts were saved
-        Serial.print(".");
         Serial.print(F("Hourly: "));
         Serial.print(hourlyPersonCount);
         Serial.print(F(" Daily: "));
@@ -708,6 +685,8 @@ void CheckForBump() // This is where we check to see if an interrupt is set when
         Serial.print(bootcount);
         Serial.print(F("  Time: "));
         PrintTimeDate(t);
+        ledState = !ledState;              // toggle the status of the LEDPIN:
+        digitalWrite(REDLED, ledState);    // update the LED pin itself
     }
 }
 
@@ -969,7 +948,8 @@ void pinChangeISR()        // Sensor Interrupt Handler
     // we don't really need to execute any special functions here, since we
     // just want the thing to wake up
     sleep_disable();         // first thing after waking from sleep is to disable sleep...
-    detachInterrupt(INTNUMBER);      // disables interrupt
+    detachInterrupt(INTNUMBER);      // disables Accelerometer interrupt
+    ClearPinChangeInterrupt(PIRPIN);    // Disables PIR interrupt
 }
 
 void SetPinChangeInterrupt(byte Pin)  // Here is where we set the pinchange interrupt
@@ -989,9 +969,9 @@ void ClearPinChangeInterrupt(byte Pin)  // Here is where we clear the pinchange 
 ISR (PCINT2_vect)   // interrupt service routine in sleep mode for PIR PinChange Interrupt (D0-D7)
 {
     // execute code here after wake-up before returning to the loop() function
-    if (inTest == 1 && digitalReadFast(PIRPIN)) {       // remember this is a pin change - want to make sure it is HIGH
-        PIRInt = true;  //
-    }
+    sleep_disable ();           // first thing after waking from sleep:
+    detachInterrupt(INTNUMBER);      // disables Accelerometer interrupt
+    ClearPinChangeInterrupt(PIRPIN);    // Disables PIR interrupt
 }
 
 
@@ -1004,6 +984,7 @@ void sleepNow()         // here we put the arduino to sleep
     noInterrupts ();          // make sure we don't get interrupted before we sleep
     sleep_enable();          // enables the sleep bit in the mcucr register
     attachInterrupt(INTNUMBER,pinChangeISR, LOW); // use interrupt and run function
+    SetPinChangeInterrupt(PIRPIN);      // Attach the PinChange Interrupt
     interrupts ();           // interrupts allowed now, next instruction WILL be executed
     sleep_cpu();            // here the device is actually put to sleep!!
     // THE PROGRAM CONTINUES FROM HERE AFTER WAKING UP
